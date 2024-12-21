@@ -12,7 +12,6 @@ jobs:
     
     env:
       OLLAMA_HOST: http://localhost:11434
-      REVIEW_CATEGORIES: "1. COMPREHENSIVE CODE ANALYSIS, 2. CRITICAL BUG DETECTION, 3. CODE QUALITY ASSESSMENT, 4. PERFORMANCE OPTIMIZATION, 5. SECURITY VULNERABILITY ASSESSMENT, 6. SCALABILITY AND ARCHITECTURE, 7. ERROR HANDLING AND RESILIENCE, 8. CODE MODERNIZATION SUGGESTIONS, 9. COMPLIANCE AND STANDARDS, 10. CONCLUSIVE RECOMMENDATION"
     
     steps:
     - name: Checkout Repository
@@ -49,7 +48,7 @@ jobs:
     - name: Install Python Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests flask flask-cors
+        pip install requests flask flask-cors radon lizard pylint
     
     - name: Create Review Script
       run: |
@@ -61,8 +60,167 @@ jobs:
         from flask import Flask, request, jsonify
         from threading import Thread
         import time
+        import radon.raw as raw
+        import radon.metrics as metrics
+        from radon.visitors import ComplexityVisitor
+        import lizard
+        from pylint import lint
+        from pylint.reporters import JSONReporter
+        from io import StringIO
+        import sys
+        import re
 
         app = Flask(__name__)
+
+        def analyze_code_metrics(code):
+            """Generate code metrics using various tools."""
+            metrics_data = {}
+            
+            # Basic metrics using radon
+            raw_metrics = raw.analyze(code)
+            metrics_data['loc'] = raw_metrics.loc
+            metrics_data['lloc'] = raw_metrics.lloc
+            metrics_data['sloc'] = raw_metrics.sloc
+            metrics_data['comments'] = raw_metrics.comments
+            
+            # Cyclomatic complexity using radon
+            try:
+                complexity = ComplexityVisitor.from_code(code)
+                metrics_data['complexity'] = {block.name: block.complexity for block in complexity.functions}
+            except:
+                metrics_data['complexity'] = {}
+            
+            # Additional metrics using lizard
+            try:
+                lizard_analysis = lizard.analyze_file.analyze_source_code("temp.py", code)
+                metrics_data['function_count'] = len(lizard_analysis.function_list)
+                metrics_data['avg_function_length'] = sum(f.length for f in lizard_analysis.function_list) / len(lizard_analysis.function_list) if lizard_analysis.function_list else 0
+            except:
+                metrics_data['function_count'] = 0
+                metrics_data['avg_function_length'] = 0
+            
+            return metrics_data
+
+        def generate_mermaid_diagrams(metrics, filename):
+            """Generate Mermaid diagrams based on code metrics."""
+            diagrams = {}
+            
+            # Complexity pie chart
+            pie_chart = """
+            pie title Code Composition
+                "Logical Lines" : {lloc}
+                "Comments" : {comments}
+                "Empty Lines" : {empty}
+            """.format(
+                lloc=metrics['lloc'],
+                comments=metrics['comments'],
+                empty=metrics['loc'] - metrics['sloc']
+            )
+            diagrams['composition'] = pie_chart
+            
+            # Complexity bar chart
+            if metrics['complexity']:
+                bar_chart = """
+                gitGraph
+                    commit id: "Overall"
+                    commit id: "Functions"
+                """
+                for func, comp in metrics['complexity'].items():
+                    bar_chart += f'\n    commit id: "{func}: {comp}"'
+                diagrams['complexity'] = bar_chart
+            
+            # Function metrics
+            if metrics['function_count'] > 0:
+                metrics_chart = f"""
+                stateDiagram-v2
+                    Functions: {metrics['function_count']} Functions
+                    AvgLength: Avg Length: {metrics['avg_function_length']:.1f} lines
+                    Functions --> AvgLength
+                """
+                diagrams['functions'] = metrics_chart
+            
+            return diagrams
+
+        def generate_review_prompt(code, filename):
+            """
+            Generate a detailed, structured prompt for comprehensive code review.
+            
+            Returns:
+                str: A meticulously crafted prompt for thorough code analysis
+            """
+            return f"""You are a senior software engineer and code quality expert performing an exhaustive code review. 
+            Analyze the provided code with extreme depth and precision across multiple critical dimensions:
+            1. COMPREHENSIVE CODE ANALYSIS
+               - Detailed algorithmic breakdown
+               - Architectural design evaluation
+               - Potential design pattern applications
+               - Code complexity metrics
+            2. CRITICAL BUG DETECTION
+               - Identify latent and manifest bugs
+               - Potential runtime vulnerabilities
+               - Edge case failure scenarios
+               - Subtle logical inconsistencies
+               - Performance-related anti-patterns
+            3. CODE QUALITY ASSESSMENT
+               - Adherence to language-specific best practices
+               - Naming convention compliance
+               - Modularity and separation of concerns
+               - Code duplication analysis
+               - Maintainability index
+            4. PERFORMANCE OPTIMIZATION
+               - Time complexity analysis
+               - Space complexity evaluation
+               - Potential bottlenecks
+               - Algorithmic efficiency recommendations
+               - Resource utilization patterns
+            5. SECURITY VULNERABILITY ASSESSMENT
+               - Potential injection points
+               - Authentication and authorization weaknesses
+               - Data validation and sanitization gaps
+               - Cryptographic considerations
+               - Threat modeling insights
+            6. SCALABILITY AND ARCHITECTURE
+               - Horizontal and vertical scaling potential
+               - Architectural flexibility
+               - Dependency management
+               - System integration considerations
+               - Future extensibility
+            7. ERROR HANDLING AND RESILIENCE
+               - Exception management strategies
+               - Graceful degradation mechanisms
+               - Logging and monitoring recommendations
+               - Fault tolerance evaluation
+            8. CODE MODERNIZATION SUGGESTIONS
+               - Language-specific idiomatic improvements
+               - Recommended design pattern refactorings
+               - Modern programming paradigm alignments
+               - Technical debt reduction strategies
+            9. COMPLIANCE AND STANDARDS
+               - Industry coding standards adherence
+               - Potential regulatory compliance issues
+               - Best practice alignment
+               - Code review checklist validation
+            10. CONCLUSIVE RECOMMENDATION
+                - Holistic code quality rating
+                - Priority-ranked improvement suggestions
+                - Potential refactoring roadmap
+                - Advanced optimization strategies
+
+            Additional Requirements:
+            - Include any identified metrics in your analysis
+            - Suggest specific values for severity levels (High/Medium/Low)
+            - Quantify potential performance improvements
+            
+            CODE TO ANALYZE:
+            ```
+            {code}
+            ```
+            ANALYSIS FORMAT:
+            - Use clear, professional technical language
+            - Provide concrete, implementable recommendations
+            - Include severity levels for each observation
+            - Quantify improvements where possible
+            """
 
         @app.route('/api/review', methods=['POST'])
         def review_code():
@@ -71,14 +229,14 @@ jobs:
                 code = data['code']
                 filename = data['fileName']
                 
-                # Prepare prompt for code review
-                prompt = f"""Please review the following code from {filename}. Provide a comprehensive analysis covering:
-                {os.getenv('REVIEW_CATEGORIES')}
+                # Generate code metrics
+                metrics = analyze_code_metrics(code)
                 
-                Here's the code to review:
+                # Generate visualizations
+                diagrams = generate_mermaid_diagrams(metrics, filename)
                 
-                {code}
-                """
+                # Generate the review prompt
+                prompt = generate_review_prompt(code, filename)
                 
                 # Send to local Ollama
                 response = requests.post(
@@ -95,7 +253,9 @@ jobs:
                     return jsonify({
                         'fileName': filename,
                         'reviewResults': {
-                            'comprehensive_review': review_text
+                            'comprehensive_review': review_text,
+                            'metrics': metrics,
+                            'diagrams': diagrams
                         }
                     })
                 else:
@@ -182,6 +342,38 @@ jobs:
                 
             report += f"## Overview\n\n**Files Reviewed:** {len(reviews)}\n\n"
             
+            # Generate summary metrics
+            total_loc = 0
+            total_complexity = 0
+            total_functions = 0
+            
+            for review in reviews:
+                if not review:
+                    continue
+                metrics = review.get('reviewResults', {}).get('metrics', {})
+                total_loc += metrics.get('loc', 0)
+                total_functions += metrics.get('function_count', 0)
+                total_complexity += sum(metrics.get('complexity', {}).values())
+            
+            report += "## Repository Metrics\n\n"
+            report += f"- Total Lines of Code: {total_loc:,}\n"
+            report += f"- Total Functions: {total_functions}\n"
+            report += f"- Average Complexity: {total_complexity/total_functions if total_functions else 0:.2f}\n\n"
+            
+            # Add repository-wide charts
+            report += "## Repository Overview\n\n"
+            report += """```mermaid
+            pie title Repository Composition
+                "Code" : {code}
+                "Functions" : {funcs}
+                "Complexity" : {comp}
+            ```\n\n""".format(
+                code=total_loc,
+                funcs=total_functions,
+                comp=int(total_complexity)
+            )
+            
+            # Individual file reviews
             for review in reviews:
                 if not review:
                     continue
@@ -189,8 +381,25 @@ jobs:
                 filename = review.get('fileName', 'Unknown File')
                 review_results = review.get('reviewResults', {})
                 comprehensive_review = review_results.get('comprehensive_review', '')
+                diagrams = review_results.get('diagrams', {})
                 
                 report += f"## File: `{filename}`\n\n"
+                
+                # Add code composition diagram
+                if 'composition' in diagrams:
+                    report += "### Code Composition\n\n"
+                    report += "```mermaid\n" + diagrams['composition'] + "\n```\n\n"
+                
+                # Add complexity diagram
+                if 'complexity' in diagrams:
+                    report += "### Complexity Analysis\n\n"
+                    report += "```mermaid\n" + diagrams['complexity'] + "\n```\n\n"
+                
+                # Add function metrics diagram
+                if 'functions' in diagrams:
+                    report += "### Function Metrics\n\n"
+                    report += "```mermaid\n" + diagrams['functions'] + "\n```\n\n"
+                
                 report += f"### Review\n\n{comprehensive_review}\n\n"
                 report += "---\n\n"
             
