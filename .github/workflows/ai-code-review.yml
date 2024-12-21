@@ -122,7 +122,7 @@ jobs:
     
     - name: Pull and Verify Llama Model
       run: |
-        ollama pull llama2:latest
+        ollama pull llama3.2:latest
         # Verify model is pulled correctly
         ollama list | grep llama2
     
