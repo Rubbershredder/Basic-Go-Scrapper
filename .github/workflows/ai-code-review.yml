@@ -94,7 +94,6 @@ jobs:
         - Review API design principles
     
     steps:
-    # Rest of the workflow remains the same
     - name: Checkout Repository
       uses: actions/checkout@v4
     
@@ -165,7 +164,7 @@ jobs:
                 response = requests.post(
                     f"{os.getenv('OLLAMA_HOST')}/api/generate",
                     json={
-                        "model": "llama2",
+                        "model": "llama3.2:latest",
                         "prompt": prompt,
                         "stream": False
                     }
@@ -203,7 +202,7 @@ jobs:
         # Verify server is running
         if curl -s http://localhost:5000/api/review -X POST -H "Content-Type: application/json" -d '{"code":"test","fileName":"test.py"}' > /dev/null; then
           echo "✓ Review server is operational"
-        else
+        else:
           echo "× Failed to verify review server"
           exit 1
         fi
