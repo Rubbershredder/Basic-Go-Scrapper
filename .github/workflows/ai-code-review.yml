@@ -22,14 +22,13 @@ jobs:
       with:
         python-version: '3.9'
     
-    - name: Install Ollama
+    - name: Install Dependencies
       run: |
+        # Install Ollama
         curl -fsSL https://ollama.com/install.sh | sh
-        
-        # Start Ollama service
         ollama serve &
         
-        # Wait for Ollama to be fully operational
+        # Wait for Ollama service
         for i in {1..30}; do
           if curl -s http://localhost:11434/api/health >/dev/null; then
             echo "✓ Ollama is running"
@@ -38,396 +37,379 @@ jobs:
           echo "Waiting for Ollama to start..."
           sleep 2
         done
-    
-    - name: Pull and Verify Llama Model
-      run: |
-        ollama pull llama2:latest
-        # Verify model is pulled correctly
-        ollama list | grep llama2
-    
-    - name: Install Python Dependencies
-      run: |
+        
+        # Install Python dependencies
         python -m pip install --upgrade pip
         pip install requests flask flask-cors radon lizard pylint
-    
-    - name: Create Review Script
+        
+        # Pull Llama model
+        ollama pull llama2:latest
+        ollama list | grep llama2
+
+    - name: Create Review System
       run: |
-        cat > review_code.py << 'EOF'
-        import os
-        import requests
-        import json
-        import traceback
-        from flask import Flask, request, jsonify
-        from threading import Thread
-        import time
-        import radon.raw as raw
-        import radon.metrics as metrics
-        from radon.visitors import ComplexityVisitor
-        import lizard
-        from pylint import lint
-        from pylint.reporters import JSONReporter
-        from io import StringIO
-        import sys
-        import re
+        cat > code_review_system.py << 'EOF'
+import os
+import sys
+import json
+import traceback
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Any
+import requests
+from flask import Flask, request, jsonify
+from threading import Thread
+import radon.raw as raw
+from radon.visitors import ComplexityVisitor
+import lizard
 
-        app = Flask(__name__)
+app = Flask(__name__)
 
-        def analyze_code_metrics(code):
-            """Generate code metrics using various tools."""
-            metrics_data = {}
-            
-            # Basic metrics using radon
+@dataclass
+class CodeMetrics:
+    loc: int = 0
+    lloc: int = 0
+    sloc: int = 0
+    comments: int = 0
+    function_count: int = 0
+    avg_function_length: float = 0
+    complexity: Dict[str, int] = None
+    functions: List[Dict] = None
+    
+    def __post_init__(self):
+        if self.complexity is None:
+            self.complexity = {}
+        if self.functions is None:
+            self.functions = []
+
+class CodeReviewer:
+    def __init__(self, ollama_host: str):
+        self.ollama_host = ollama_host
+        
+    def analyze_metrics(self, code: str) -> CodeMetrics:
+        """Generate comprehensive code metrics."""
+        metrics = CodeMetrics()
+        
+        try:
+            # Basic metrics
             raw_metrics = raw.analyze(code)
-            metrics_data['loc'] = raw_metrics.loc
-            metrics_data['lloc'] = raw_metrics.lloc
-            metrics_data['sloc'] = raw_metrics.sloc
-            metrics_data['comments'] = raw_metrics.comments
+            metrics.loc = raw_metrics.loc
+            metrics.lloc = raw_metrics.lloc
+            metrics.sloc = raw_metrics.sloc
+            metrics.comments = raw_metrics.comments
             
-            # Cyclomatic complexity using radon
-            try:
-                complexity = ComplexityVisitor.from_code(code)
-                metrics_data['complexity'] = {block.name: block.complexity for block in complexity.functions}
-            except:
-                metrics_data['complexity'] = {}
-            
-            # Additional metrics using lizard
-            try:
-                lizard_analysis = lizard.analyze_file.analyze_source_code("temp.py", code)
-                metrics_data['function_count'] = len(lizard_analysis.function_list)
-                metrics_data['avg_function_length'] = sum(f.length for f in lizard_analysis.function_list) / len(lizard_analysis.function_list) if lizard_analysis.function_list else 0
-            except:
-                metrics_data['function_count'] = 0
-                metrics_data['avg_function_length'] = 0
-            
-            return metrics_data
-
-        def generate_mermaid_diagrams(metrics, filename):
-            """Generate Mermaid diagrams based on code metrics."""
-            diagrams = {}
-            
-            # Complexity pie chart
-            pie_chart = """
-            pie title Code Composition
-                "Logical Lines" : {lloc}
-                "Comments" : {comments}
-                "Empty Lines" : {empty}
-            """.format(
-                lloc=metrics['lloc'],
-                comments=metrics['comments'],
-                empty=metrics['loc'] - metrics['sloc']
-            )
-            diagrams['composition'] = pie_chart
-            
-            # Complexity bar chart
-            if metrics['complexity']:
-                bar_chart = """
-                gitGraph
-                    commit id: "Overall"
-                    commit id: "Functions"
-                """
-                for func, comp in metrics['complexity'].items():
-                    bar_chart += f'\n    commit id: "{func}: {comp}"'
-                diagrams['complexity'] = bar_chart
+            # Complexity metrics
+            complexity = ComplexityVisitor.from_code(code)
+            metrics.complexity = {block.name: block.complexity for block in complexity.functions}
             
             # Function metrics
-            if metrics['function_count'] > 0:
-                metrics_chart = f"""
-                stateDiagram-v2
-                    Functions: {metrics['function_count']} Functions
-                    AvgLength: Avg Length: {metrics['avg_function_length']:.1f} lines
-                    Functions --> AvgLength
-                """
-                diagrams['functions'] = metrics_chart
+            analysis = lizard.analyze_file.analyze_source_code("temp.py", code)
+            metrics.function_count = len(analysis.function_list)
+            metrics.avg_function_length = (
+                sum(f.length for f in analysis.function_list) / len(analysis.function_list)
+                if analysis.function_list else 0
+            )
+            metrics.functions = [{
+                'name': f.name,
+                'length': f.length,
+                'complexity': f.cyclomatic_complexity,
+                'tokens': f.token_count,
+                'parameters': f.parameter_count
+            } for f in analysis.function_list]
             
-            return diagrams
-
-        def generate_review_prompt(code, filename):
-            """
-            Generate a detailed, structured prompt for comprehensive code review.
+        except Exception as e:
+            print(f"Error analyzing metrics: {str(e)}")
             
-            Returns:
-                str: A meticulously crafted prompt for thorough code analysis
-            """
-            return f"""You are a senior software engineer and code quality expert performing an exhaustive code review. 
-            Analyze the provided code with extreme depth and precision across multiple critical dimensions:
-            1. COMPREHENSIVE CODE ANALYSIS
-               - Detailed algorithmic breakdown
-               - Architectural design evaluation
-               - Potential design pattern applications
-               - Code complexity metrics
-            2. CRITICAL BUG DETECTION
-               - Identify latent and manifest bugs
-               - Potential runtime vulnerabilities
-               - Edge case failure scenarios
-               - Subtle logical inconsistencies
-               - Performance-related anti-patterns
-            3. CODE QUALITY ASSESSMENT
-               - Adherence to language-specific best practices
-               - Naming convention compliance
-               - Modularity and separation of concerns
-               - Code duplication analysis
-               - Maintainability index
-            4. PERFORMANCE OPTIMIZATION
-               - Time complexity analysis
-               - Space complexity evaluation
-               - Potential bottlenecks
-               - Algorithmic efficiency recommendations
-               - Resource utilization patterns
-            5. SECURITY VULNERABILITY ASSESSMENT
-               - Potential injection points
-               - Authentication and authorization weaknesses
-               - Data validation and sanitization gaps
-               - Cryptographic considerations
-               - Threat modeling insights
-            6. SCALABILITY AND ARCHITECTURE
-               - Horizontal and vertical scaling potential
-               - Architectural flexibility
-               - Dependency management
-               - System integration considerations
-               - Future extensibility
-            7. ERROR HANDLING AND RESILIENCE
-               - Exception management strategies
-               - Graceful degradation mechanisms
-               - Logging and monitoring recommendations
-               - Fault tolerance evaluation
-            8. CODE MODERNIZATION SUGGESTIONS
-               - Language-specific idiomatic improvements
-               - Recommended design pattern refactorings
-               - Modern programming paradigm alignments
-               - Technical debt reduction strategies
-            9. COMPLIANCE AND STANDARDS
-               - Industry coding standards adherence
-               - Potential regulatory compliance issues
-               - Best practice alignment
-               - Code review checklist validation
-            10. CONCLUSIVE RECOMMENDATION
-                - Holistic code quality rating
-                - Priority-ranked improvement suggestions
-                - Potential refactoring roadmap
-                - Advanced optimization strategies
-
-            Additional Requirements:
-            - Include any identified metrics in your analysis
-            - Suggest specific values for severity levels (High/Medium/Low)
-            - Quantify potential performance improvements
-            
-            CODE TO ANALYZE:
-            ```
-            {code}
-            ```
-            ANALYSIS FORMAT:
-            - Use clear, professional technical language
-            - Provide concrete, implementable recommendations
-            - Include severity levels for each observation
-            - Quantify improvements where possible
-            """
-
-        @app.route('/api/review', methods=['POST'])
-        def review_code():
-            try:
-                data = request.json
-                code = data['code']
-                filename = data['fileName']
-                
-                # Generate code metrics
-                metrics = analyze_code_metrics(code)
-                
-                # Generate visualizations
-                diagrams = generate_mermaid_diagrams(metrics, filename)
-                
-                # Generate the review prompt
-                prompt = generate_review_prompt(code, filename)
-                
-                # Send to local Ollama
-                response = requests.post(
-                    f"{os.getenv('OLLAMA_HOST')}/api/generate",
-                    json={
-                        "model": "llama2",
-                        "prompt": prompt,
-                        "stream": False
-                    }
-                )
-                
-                if response.status_code == 200:
-                    review_text = response.json()['response']
-                    return jsonify({
-                        'fileName': filename,
-                        'reviewResults': {
-                            'comprehensive_review': review_text,
-                            'metrics': metrics,
-                            'diagrams': diagrams
-                        }
-                    })
-                else:
-                    return jsonify({'error': 'Failed to get review from Ollama'}), 500
-                    
-            except Exception as e:
-                return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-        def run_flask():
-            app.run(host='0.0.0.0', port=5000)
-
-        if __name__ == '__main__':
-            flask_thread = Thread(target=run_flask)
-            flask_thread.start()
-            print("Flask server started")
-        EOF
+        return metrics
     
-    - name: Start Review Server
+    def generate_diagrams(self, metrics: CodeMetrics) -> Dict[str, str]:
+        """Generate Mermaid diagrams from metrics."""
+        diagrams = {}
+        
+        # Code composition
+        diagrams['composition'] = f"""
+        pie title Code Composition
+            "Logical Lines" : {metrics.lloc}
+            "Comments" : {metrics.comments}
+            "Empty Lines" : {metrics.loc - metrics.sloc}
+        """
+        
+        # Function complexity
+        if metrics.functions:
+            diagrams['complexity'] = """
+            xychart-beta
+                title "Function Complexity"
+                x-axis [{}]
+                y-axis "Complexity" 0 --> 20
+                bar [{}]
+            """.format(
+                ", ".join(f'"{f["name"]}"' for f in metrics.functions),
+                ", ".join(str(f["complexity"]) for f in metrics.functions)
+            )
+        
+        # Function metrics
+        if metrics.function_count > 0:
+            diagrams['functions'] = f"""
+            stateDiagram-v2
+                [*] --> Overview
+                Overview : {metrics.function_count} Functions
+                Overview : Avg Length: {metrics.avg_function_length:.1f} lines
+                Overview --> Details
+                Details : Parameters: {sum(f['parameters'] for f in metrics.functions)}
+                Details : Tokens: {sum(f['tokens'] for f in metrics.functions)}
+            """
+        
+        return diagrams
+    
+    def generate_review_prompt(self, code: str, filename: str) -> str:
+        """Generate AI review prompt."""
+        return f"""As a senior software engineer, perform a comprehensive code review analyzing:
+
+1. Code Quality
+   - Design patterns and architecture
+   - Code organization and maintainability
+   - Naming conventions and readability
+   - Documentation completeness
+
+2. Performance
+   - Algorithmic efficiency
+   - Resource usage
+   - Potential bottlenecks
+   - Optimization opportunities
+
+3. Security
+   - Input validation
+   - Authentication/authorization
+   - Data protection
+   - Security best practices
+
+4. Reliability
+   - Error handling
+   - Edge cases
+   - Resource cleanup
+   - Testing coverage
+
+Structure your review with:
+- Summary
+- Critical Issues (High/Medium/Low severity)
+- Specific Recommendations
+- Best Practices
+
+Code to review:
+```
+{code}
+```
+"""
+    
+    def get_ai_review(self, code: str, filename: str) -> Optional[str]:
+        """Get AI review from Ollama."""
+        try:
+            response = requests.post(
+                f"{self.ollama_host}/api/generate",
+                json={
+                    "model": "llama2",
+                    "prompt": self.generate_review_prompt(code, filename),
+                    "stream": False
+                },
+                timeout=300
+            )
+            
+            if response.status_code == 200:
+                return response.json()['response']
+            
+            print(f"Ollama error: {response.status_code} - {response.text}")
+            return None
+            
+        except Exception as e:
+            print(f"Error getting AI review: {str(e)}")
+            return None
+
+@app.route('/api/review', methods=['POST'])
+def review_code():
+    """API endpoint for code review."""
+    try:
+        data = request.json
+        code = data['code']
+        filename = data.get('fileName', 'unknown.py')
+        
+        reviewer = CodeReviewer(os.getenv('OLLAMA_HOST', 'http://localhost:11434'))
+        
+        # Generate metrics and diagrams
+        metrics = reviewer.analyze_metrics(code)
+        diagrams = reviewer.generate_diagrams(metrics)
+        
+        # Get AI review
+        review_text = reviewer.get_ai_review(code, filename)
+        
+        return jsonify({
+            'fileName': filename,
+            'reviewResults': {
+                'metrics': asdict(metrics),
+                'diagrams': diagrams,
+                'comprehensive_review': review_text
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+def run_server():
+    """Run Flask server."""
+    app.run(host='0.0.0.0', port=5000)
+
+if __name__ == '__main__':
+    server_thread = Thread(target=run_server, daemon=True)
+    server_thread.start()
+    print("Review server started on port 5000")
+EOF
+
+    - name: Start Review System
       run: |
-        python review_code.py &
+        python code_review_system.py &
         echo "Waiting for server to start..."
         sleep 5
         
-        # Verify server is running
-        if curl -s http://localhost:5000/api/review -X POST -H "Content-Type: application/json" -d '{"code":"test","fileName":"test.py"}' > /dev/null; then
-          echo "✓ Review server is operational"
+        # Verify server
+        if curl -s http://localhost:5000/api/review -X POST \
+           -H "Content-Type: application/json" \
+           -d '{"code":"def test(): pass","fileName":"test.py"}' > /dev/null; then
+          echo "✓ Review server operational"
         else
           echo "× Failed to verify review server"
           exit 1
         fi
     
-    - name: Run Code Review
+    - name: Run Reviews
       run: |
-        mkdir -p code-reviews
-        
         python3 << 'EOF'
-        import os
-        import requests
-        import json
-        
-        def is_source_file(path):
-            source_extensions = [
-                '.py', '.js', '.jsx', '.ts', '.tsx', 
-                '.java', '.cpp', '.c', '.rb', '.go', 
-                '.php', '.swift', '.kt', '.rs', 
-                '.html', '.css', '.scss', '.lua'
-            ]
-            return any(path.endswith(ext) for ext in source_extensions)
-        
-        def should_exclude(path):
-            exclude_dirs = [
-                '.git', 'node_modules', 'dist', 'build', 
-                'venv', '.venv', 'env', '.env', 
-                'coverage', 'logs', '__pycache__'
-            ]
-            return any(exclude in path.split(os.path.sep) for exclude in exclude_dirs)
-        
-        def review_file(file_path):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    code = f.read()
-                
-                response = requests.post(
-                    'http://localhost:5000/api/review',
-                    json={'code': code, 'fileName': os.path.basename(file_path)},
-                    timeout=300
-                )
-                
-                if response.status_code == 200:
-                    return response.json()
-                else:
-                    print(f"Error reviewing {file_path}: {response.text}")
-                return None
-            except Exception as e:
-                print(f"Exception reviewing {file_path}: {str(e)}")
-                return None
-        
-        def generate_report(reviews):
-            report = "# 🤖 AI Code Review Report\n\n"
-            
-            if not reviews:
-                report += "No files were reviewed.\n"
-                return report
-                
-            report += f"## Overview\n\n**Files Reviewed:** {len(reviews)}\n\n"
-            
-            # Generate summary metrics
-            total_loc = 0
-            total_complexity = 0
-            total_functions = 0
-            
-            for review in reviews:
-                if not review:
-                    continue
-                metrics = review.get('reviewResults', {}).get('metrics', {})
-                total_loc += metrics.get('loc', 0)
-                total_functions += metrics.get('function_count', 0)
-                total_complexity += sum(metrics.get('complexity', {}).values())
-            
-            report += "## Repository Metrics\n\n"
-            report += f"- Total Lines of Code: {total_loc:,}\n"
-            report += f"- Total Functions: {total_functions}\n"
-            report += f"- Average Complexity: {total_complexity/total_functions if total_functions else 0:.2f}\n\n"
-            
-            # Add repository-wide charts
-            report += "## Repository Overview\n\n"
-            report += """```mermaid
-            pie title Repository Composition
-                "Code" : {code}
-                "Functions" : {funcs}
-                "Complexity" : {comp}
-            ```\n\n""".format(
-                code=total_loc,
-                funcs=total_functions,
-                comp=int(total_complexity)
-            )
-            
-            # Individual file reviews
-            for review in reviews:
-                if not review:
-                    continue
-                    
-                filename = review.get('fileName', 'Unknown File')
-                review_results = review.get('reviewResults', {})
-                comprehensive_review = review_results.get('comprehensive_review', '')
-                diagrams = review_results.get('diagrams', {})
-                
-                report += f"## File: `{filename}`\n\n"
-                
-                # Add code composition diagram
-                if 'composition' in diagrams:
-                    report += "### Code Composition\n\n"
-                    report += "```mermaid\n" + diagrams['composition'] + "\n```\n\n"
-                
-                # Add complexity diagram
-                if 'complexity' in diagrams:
-                    report += "### Complexity Analysis\n\n"
-                    report += "```mermaid\n" + diagrams['complexity'] + "\n```\n\n"
-                
-                # Add function metrics diagram
-                if 'functions' in diagrams:
-                    report += "### Function Metrics\n\n"
-                    report += "```mermaid\n" + diagrams['functions'] + "\n```\n\n"
-                
-                report += f"### Review\n\n{comprehensive_review}\n\n"
-                report += "---\n\n"
-            
-            return report
-        
-        # Main review process
-        reviews = []
-        for root, _, files in os.walk('.'):
-            for file in files:
-                full_path = os.path.join(root, file)
-                
-                if should_exclude(full_path) or not is_source_file(full_path):
-                    continue
-                
-                print(f"Reviewing: {full_path}")
-                review = review_file(full_path)
-                if review:
-                    reviews.append(review)
-        
-        # Generate and save report
-        report = generate_report(reviews)
-        with open('code-reviews/review_report.md', 'w', encoding='utf-8') as f:
-            f.write(report)
-        
-        print("Review completed. Report generated at code-reviews/review_report.md")
-        EOF
+import os
+import json
+import requests
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+def is_source_file(path: Path) -> bool:
+    """Check if file is a source code file."""
+    source_extensions = {
+        '.py', '.js', '.jsx', '.ts', '.tsx', '.java',
+        '.cpp', '.c', '.rb', '.go', '.php', '.swift',
+        '.kt', '.rs', '.html', '.css', '.scss'
+    }
+    return path.suffix.lower() in source_extensions
+
+def should_skip(path: Path) -> bool:
+    """Check if path should be skipped."""
+    skip_patterns = {
+        '.git', 'node_modules', 'dist', 'build',
+        'venv', '.env', 'coverage', '__pycache__',
+        'test', 'tests', 'tmp', 'temp'
+    }
+    return any(part in skip_patterns for part in path.parts)
+
+def review_file(path: Path) -> Optional[Dict[str, Any]]:
+    """Send file for review."""
+    try:
+        code = path.read_text(encoding='utf-8')
+        response = requests.post(
+            'http://localhost:5000/api/review',
+            json={'code': code, 'fileName': path.name},
+            timeout=300
+        )
+        return response.json() if response.status_code == 200 else None
+    except Exception as e:
+        print(f"Error reviewing {path}: {e}")
+        return None
+
+def generate_report(reviews: List[Dict[str, Any]]) -> str:
+    """Generate markdown report from reviews."""
+    if not reviews:
+        return "# No files were reviewed."
     
-    - name: Commit Review Results
+    # Calculate repository metrics
+    total_loc = sum(r['reviewResults']['metrics']['loc'] for r in reviews if r)
+    total_funcs = sum(r['reviewResults']['metrics']['function_count'] for r in reviews if r)
+    total_complexity = sum(
+        sum(c for c in r['reviewResults']['metrics']['complexity'].values())
+        for r in reviews if r
+    )
+    
+    report = [
+        "# 🤖 AI Code Review Report\n",
+        f"## Repository Overview\n",
+        f"- Files Analyzed: {len(reviews)}",
+        f"- Total Lines: {total_loc:,}",
+        f"- Total Functions: {total_funcs}",
+        f"- Average Complexity: {total_complexity/total_funcs:.2f if total_funcs else 0}\n",
+        "```mermaid",
+        "pie title Repository Composition",
+        f'    "Code" : {total_loc}',
+        f'    "Functions" : {total_funcs}',
+        f'    "Complexity" : {int(total_complexity)}',
+        "```\n"
+    ]
+    
+    # Add individual file reviews
+    for review in reviews:
+        if not review:
+            continue
+            
+        file_name = review['fileName']
+        results = review['reviewResults']
+        
+        report.extend([
+            f"## File: `{file_name}`\n",
+            "### Metrics\n",
+            f"- Lines of Code: {results['metrics']['loc']}",
+            f"- Functions: {results['metrics']['function_count']}",
+            f"- Comments: {results['metrics']['comments']}\n"
+        ])
+        
+        # Add diagrams
+        for name, diagram in results['diagrams'].items():
+            report.extend([
+                f"### {name.title()}\n",
+                "```mermaid",
+                diagram.strip(),
+                "```\n"
+            ])
+        
+        # Add AI review
+        if results.get('comprehensive_review'):
+            report.extend([
+                "### AI Review\n",
+                results['comprehensive_review'],
+                "\n---\n"
+            ])
+    
+    return '\n'.join(report)
+
+def main():
+    """Main review process."""
+    # Create output directory
+    output_dir = Path('code-reviews')
+    output_dir.mkdir(exist_ok=True)
+    
+    # Review files
+    reviews = []
+    for path in Path('.').rglob('*'):
+        if path.is_file() and is_source_file(path) and not should_skip(path):
+            print(f"Reviewing: {path}")
+            if review := review_file(path):
+                reviews.append(review)
+    
+    # Generate and save report
+    report = generate_report(reviews)
+    report_path = output_dir / 'review_report.md'
+    report_path.write_text(report, encoding='utf-8')
+    print(f"Report generated: {report_path}")
+
+if __name__ == '__main__':
+    main()
+EOF
+
+    - name: Commit Results
       run: |
         git config user.name github-actions
         git config user.email github-actions@github.com
