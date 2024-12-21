@@ -1,40 +1,31 @@
-# .github/workflows/code-review.yml
 name: Universal AI Code Review
-
 on:
   push:
     branches: [ main, master, development ]
   pull_request:
     branches: [ main, master, development ]
-
 jobs:
   ai-code-review:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
     
     env:
       OLLAMA_HOST: http://localhost:11434
+      REVIEW_CATEGORIES: "1. COMPREHENSIVE CODE ANALYSIS, 2. CRITICAL BUG DETECTION, 3. CODE QUALITY ASSESSMENT, 4. PERFORMANCE OPTIMIZATION, 5. SECURITY VULNERABILITY ASSESSMENT, 6. SCALABILITY AND ARCHITECTURE, 7. ERROR HANDLING AND RESILIENCE, 8. CODE MODERNIZATION SUGGESTIONS, 9. COMPLIANCE AND STANDARDS, 10. CONCLUSIVE RECOMMENDATION"
     
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # Get full history for better diff analysis
     
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
-        cache: 'pip'  # Enable pip caching
     
     - name: Install Ollama
-      timeout-minutes: 5
       run: |
         curl -fsSL https://ollama.com/install.sh | sh
         
-        # Start Ollama service with error handling
+        # Start Ollama service
         ollama serve &
         
         # Wait for Ollama to be fully operational
@@ -43,282 +34,188 @@ jobs:
             echo "✓ Ollama is running"
             break
           fi
-          if [ $i -eq 30 ]; then
-            echo "Failed to start Ollama after 60 seconds"
-            exit 1
-          fi
           echo "Waiting for Ollama to start..."
           sleep 2
         done
     
     - name: Pull and Verify Llama Model
-      timeout-minutes: 10
       run: |
         ollama pull llama2:latest
-        if ! ollama list | grep -q llama2; then
-          echo "Failed to pull llama2 model"
-          exit 1
-        fi
+        # Verify model is pulled correctly
+        ollama list | grep llama2
     
     - name: Install Python Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install --no-cache-dir requests flask flask-cors radon lizard pylint
-
-    - name: Create Python Scripts
+        pip install requests flask flask-cors
+    
+    - name: Create Review Script
       run: |
-        mkdir -p scripts
-        cat > scripts/code_review.py << 'EOF'
-import math
-import logging
-from typing import Dict, List, Any, Optional
-import radon.raw as raw
-from radon.visitors import ComplexityVisitor
-import lizard
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def analyze_code_metrics(code: str) -> Dict[str, Any]:
-    """
-    Generate code metrics using various analysis tools.
+        cat > review_code.py << 'EOF'
+        import os
+        import requests
+        import json
+        import traceback
+        from flask import Flask, request, jsonify
+        from threading import Thread
+        import time
+        app = Flask(__name__)
+        @app.route('/api/review', methods=['POST'])
+        def review_code():
+            try:
+                data = request.json
+                code = data['code']
+                filename = data['fileName']
+                
+                # Prepare prompt for code review
+                prompt = f"""Please review the following code from {filename}. Provide a comprehensive analysis covering:
+                {os.getenv('REVIEW_CATEGORIES')}
+                
+                Here's the code to review:
+                
+                {code}
+                """
+                
+                # Send to local Ollama
+                response = requests.post(
+                    f"{os.getenv('OLLAMA_HOST')}/api/generate",
+                    json={
+                        "model": "llama2",
+                        "prompt": prompt,
+                        "stream": False
+                    }
+                )
+                
+                if response.status_code == 200:
+                    review_text = response.json()['response']
+                    return jsonify({
+                        'fileName': filename,
+                        'reviewResults': {
+                            'comprehensive_review': review_text
+                        }
+                    })
+                else:
+                    return jsonify({'error': 'Failed to get review from Ollama'}), 500
+                    
+            except Exception as e:
+                return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+        def run_flask():
+            app.run(host='0.0.0.0', port=5000)
+        if __name__ == '__main__':
+            flask_thread = Thread(target=run_flask)
+            flask_thread.start()
+            print("Flask server started")
+        EOF
     
-    Args:
-        code (str): Source code to analyze
-        
-    Returns:
-        Dict[str, Any]: Dictionary containing various code metrics
-    """
-    metrics_data = {
-        'loc': 0,
-        'lloc': 0,
-        'sloc': 0,
-        'comments': 0,
-        'function_count': 0,
-        'avg_function_length': 0,
-        'functions': []
-    }
-    
-    try:
-        # Basic metrics using radon
-        raw_metrics = raw.analyze(code)
-        metrics_data.update({
-            'loc': raw_metrics.loc,
-            'lloc': raw_metrics.lloc,
-            'sloc': raw_metrics.sloc,
-            'comments': raw_metrics.comments
-        })
-        
-        # Cyclomatic complexity using radon
-        complexity = ComplexityVisitor.from_code(code)
-        metrics_data['complexity'] = {block.name: block.complexity for block in complexity.functions}
-        
-        # Additional metrics using lizard
-        lizard_analysis = lizard.analyze_file.analyze_source_code("temp.py", code)
-        functions = lizard_analysis.function_list
-        
-        if functions:
-            metrics_data.update({
-                'function_count': len(functions),
-                'avg_function_length': sum(f.length for f in functions) / len(functions),
-                'functions': [{
-                    'name': f.name,
-                    'length': f.length,
-                    'complexity': f.cyclomatic_complexity,
-                    'token_count': f.token_count,
-                    'parameter_count': f.parameter_count
-                } for f in functions]
-            })
-        
-    except Exception as e:
-        logger.error(f"Error in analyze_code_metrics: {str(e)}", exc_info=True)
-    
-    return metrics_data
-
-def calculate_quality_score(complexity: float, functions: int) -> float:
-    """
-    Calculate a quality score based on metrics.
-    
-    Args:
-        complexity (float): Average complexity metric
-        functions (int): Number of functions
-        
-    Returns:
-        float: Quality score between 0 and 100
-    """
-    if functions == 0:
-        return 0
-    base_score = 100
-    complexity_penalty = min(30, max(0, (complexity - 5) * 3))
-    return max(0, min(100, base_score - complexity_penalty))
-
-def calculate_metric_score(value: float) -> float:
-    """
-    Normalize metric values to 0-100 scale using logarithmic scaling.
-    
-    Args:
-        value (float): Raw metric value
-        
-    Returns:
-        float: Normalized score between 0 and 100
-    """
-    if value <= 0:
-        return 0
-    return min(100, max(0, 50 - (math.log2(value) * 5)))
-
-def generate_mermaid_diagrams(metrics: Dict[str, Any], filename: str) -> Dict[str, str]:
-    """
-    Generate Mermaid diagrams based on code metrics.
-    
-    Args:
-        metrics (Dict[str, Any]): Code metrics
-        filename (str): Name of the file being analyzed
-        
-    Returns:
-        Dict[str, str]: Dictionary of diagram types and their Mermaid syntax
-    """
-    diagrams = {}
-    
-    try:
-        # Code composition pie chart
-        empty_lines = metrics['loc'] - metrics['sloc']
-        pie_chart = f"""pie title "Code Composition"
-    "Logical Lines ({metrics['lloc']})" : {metrics['lloc']}
-    "Comments ({metrics['comments']})" : {metrics['comments']}
-    "Empty Lines ({empty_lines})" : {empty_lines}"""
-        diagrams['composition'] = pie_chart
-        
-        # Function complexity chart
-        if metrics.get('functions'):
-            functions = metrics['functions'][:10]  # Limit to top 10 functions
-            names = [f['name'] for f in functions]
-            values = [f['complexity'] for f in functions]
-            max_complexity = max(values, default=0) + 2
-            
-            bar_chart = f"""xychart-beta
-    title "Function Complexity Distribution"
-    x-axis [{', '.join(f'"{n}"' for n in names)}]
-    y-axis "Complexity" 0 --> {max_complexity}
-    bar [{', '.join(str(v) for v in values)}]"""
-            diagrams['complexity'] = bar_chart
-        
-        # Generate additional diagrams...
-        
-    except Exception as e:
-        logger.error(f"Error in generate_mermaid_diagrams: {str(e)}", exc_info=True)
-    
-    return diagrams
-
-EOF
-
-        cat > scripts/review_code.py << 'EOF'
-import os
-import logging
-from typing import Dict, Any
-import requests
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from threading import Thread
-import traceback
-from code_review import analyze_code_metrics, generate_mermaid_diagrams
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
-CORS(app)
-
-def get_ollama_review(code: str, prompt: str) -> Dict[str, Any]:
-    """
-    Get code review from Ollama service.
-    
-    Args:
-        code (str): Source code to review
-        prompt (str): Review prompt
-        
-    Returns:
-        Dict[str, Any]: Review response
-    """
-    try:
-        response = requests.post(
-            f"{os.getenv('OLLAMA_HOST', 'http://localhost:11434')}/api/generate",
-            json={
-                "model": "llama2",
-                "prompt": prompt,
-                "stream": False
-            },
-            timeout=30
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Ollama API error: {str(e)}", exc_info=True)
-        raise
-
-@app.route('/api/review', methods=['POST'])
-def review_code():
-    try:
-        data = request.get_json()
-        if not data or 'code' not in data:
-            return jsonify({'error': 'No code provided'}), 400
-            
-        code = data['code']
-        filename = data.get('fileName', 'unnamed.py')
-        
-        # Generate code metrics
-        metrics = analyze_code_metrics(code)
-        
-        # Generate visualizations
-        diagrams = generate_mermaid_diagrams(metrics, filename)
-        
-        # Get AI review
-        review_response = get_ollama_review(code, generate_review_prompt(code, filename))
-        
-        return jsonify({
-            'fileName': filename,
-            'reviewResults': {
-                'metrics': metrics,
-                'diagrams': diagrams,
-                'comprehensive_review': review_response.get('response', ''),
-                'structured_review': parse_ai_review(review_response.get('response', ''))
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in review_code: {str(e)}", exc_info=True)
-        return jsonify({
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }), 500
-
-def run_flask():
-    """Run Flask server with proper error handling."""
-    try:
-        app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
-    except Exception as e:
-        logger.error(f"Failed to start Flask server: {str(e)}", exc_info=True)
-        raise
-
-if __name__ == '__main__':
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("✓ Flask server started")
-EOF
-
-    - name: Save Initial Report
+    - name: Start Review Server
       run: |
-        python -c "
-        from scripts.report_generator import generate_report
-        report = generate_report([])  # Initialize empty report
-        with open('code_review_report.md', 'w') as f:
+        python review_code.py &
+        echo "Waiting for server to start..."
+        sleep 5
+        
+        # Verify server is running
+        if curl -s http://localhost:5000/api/review -X POST -H "Content-Type: application/json" -d '{"code":"test","fileName":"test.py"}' > /dev/null; then
+          echo "✓ Review server is operational"
+        else
+          echo "× Failed to verify review server"
+          exit 1
+        fi
+    
+    - name: Run Code Review
+      run: |
+        mkdir -p code-reviews
+        
+        python3 << 'EOF'
+        import os
+        import requests
+        import json
+        
+        def is_source_file(path):
+            source_extensions = [
+                '.py', '.js', '.jsx', '.ts', '.tsx', 
+                '.java', '.cpp', '.c', '.rb', '.go', 
+                '.php', '.swift', '.kt', '.rs', 
+                '.html', '.css', '.scss', '.lua'
+            ]
+            return any(path.endswith(ext) for ext in source_extensions)
+        
+        def should_exclude(path):
+            exclude_dirs = [
+                '.git', 'node_modules', 'dist', 'build', 
+                'venv', '.venv', 'env', '.env', 
+                'coverage', 'logs', '__pycache__'
+            ]
+            return any(exclude in path.split(os.path.sep) for exclude in exclude_dirs)
+        
+        def review_file(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    code = f.read()
+                
+                response = requests.post(
+                    'http://localhost:5000/api/review',
+                    json={'code': code, 'fileName': os.path.basename(file_path)},
+                    timeout=300
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    print(f"Error reviewing {file_path}: {response.text}")
+                return None
+            except Exception as e:
+                print(f"Exception reviewing {file_path}: {str(e)}")
+                return None
+        
+        def generate_report(reviews):
+            report = "# 🤖 AI Code Review Report\n\n"
+            
+            if not reviews:
+                report += "No files were reviewed.\n"
+                return report
+                
+            report += f"## Overview\n\n**Files Reviewed:** {len(reviews)}\n\n"
+            
+            for review in reviews:
+                if not review:
+                    continue
+                    
+                filename = review.get('fileName', 'Unknown File')
+                review_results = review.get('reviewResults', {})
+                comprehensive_review = review_results.get('comprehensive_review', '')
+                
+                report += f"## File: `{filename}`\n\n"
+                report += f"### Review\n\n{comprehensive_review}\n\n"
+                report += "---\n\n"
+            
+            return report
+        
+        # Main review process
+        reviews = []
+        for root, _, files in os.walk('.'):
+            for file in files:
+                full_path = os.path.join(root, file)
+                
+                if should_exclude(full_path) or not is_source_file(full_path):
+                    continue
+                
+                print(f"Reviewing: {full_path}")
+                review = review_file(full_path)
+                if review:
+                    reviews.append(review)
+        
+        # Generate and save report
+        report = generate_report(reviews)
+        with open('code-reviews/review_report.md', 'w', encoding='utf-8') as f:
             f.write(report)
-        "
-
-    - name: Upload Report
-      uses: actions/upload-artifact@v3
-      with:
-        name: code-review-report
-        path: code_review_report.md
-        if-no-files-found: error
+        
+        print("Review completed. Report generated at code-reviews/review_report.md")
+        EOF
+    
+    - name: Commit Review Results
+      run: |
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+        git add code-reviews/review_report.md || true
+        git commit -m "Add AI Code Review Report [skip ci]" || true
+        git push || true
