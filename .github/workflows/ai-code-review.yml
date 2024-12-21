@@ -124,7 +124,7 @@ jobs:
       run: |
         ollama pull llama3.2:latest
         # Verify model is pulled correctly
-        ollama list | grep llama2
+        ollama list | grep llama3.2
     
     - name: Install Python Dependencies
       run: |
